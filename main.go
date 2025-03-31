@@ -1,113 +1,324 @@
 package main
 
 import (
-	"encoding/json"
-	"errors"
-	"net/http"
-	"sync"
-
 	"container/list"
-	"github.com/gorilla/mux"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"runtime"
+	"sync"
+	"time"
 )
 
-// CacheEntry represents a key-value pair in the cache
+const (
+	// Configuration
+	NumShards         = 32                       // Number of shards for the map
+	MaxKeySize        = 256                      // Maximum key length
+	MaxValueSize      = 256                      // Maximum value length
+	MemoryThreshold   = 0.7                      // Memory threshold (70%)
+	CleanupInterval   = 5 * time.Second          // Interval to check memory usage
+	MaxMemoryBytes    = 1.5 * 1024 * 1024 * 1024 // 1.5GB max memory (leaving headroom)
+	EvictionBatchSize = 100                      // Number of items to evict in one batch
+)
+
+// Cache entry with metadata for LRU
 type CacheEntry struct {
-	Key   string
-	Value string
+	value     string
+	timestamp time.Time
+	size      int // Size in bytes
 }
 
-// Cache implements a simple in-memory cache with LRU eviction
-type Cache struct {
-	cache    map[string]*list.Element
-	lruList  *list.List
-	capacity int
-	mu       sync.RWMutex
+// Shard is a single shard of the cache
+type Shard struct {
+	items     map[string]*list.Element
+	evictList *list.List
+	lock      sync.RWMutex
+	size      int64 // Track size in bytes
 }
 
-// NewCache returns a new cache instance
-func NewCache(capacity int) *Cache {
-	return &Cache{
-		cache:    make(map[string]*list.Element),
-		lruList:  list.New(),
-		capacity: capacity,
-	}
+// ShardedCache is our main cache structure
+type ShardedCache struct {
+	shards    [NumShards]*Shard
+	totalSize int64
+	sizeLock  sync.RWMutex
 }
 
-// Put inserts or updates a key-value pair in the cache
-func (c *Cache) Put(key, value string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+// KeyValue is used for API requests
+type KeyValue struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
 
-	if _, ok := c.cache[key]; ok {
-		// Update existing entry
-		entry := c.cache[key]
-		entry.Value.(*CacheEntry).Value = value
-		c.lruList.MoveToFront(entry)
-	} else {
-		// Add new entry if cache is not full
-		if c.lruList.Len() >= c.capacity {
-			// Evict LRU entry if cache is full
-			lruEntry := c.lruList.Back()
-			delete(c.cache, lruEntry.Value.(*CacheEntry).Key)
-			c.lruList.Remove(lruEntry)
+// Response is the API response format
+type Response struct {
+	Status  string `json:"status"`
+	Message string `json:"message,omitempty"`
+	Key     string `json:"key,omitempty"`
+	Value   string `json:"value,omitempty"`
+}
+
+// Initialize a new sharded cache
+func NewShardedCache() *ShardedCache {
+	cache := &ShardedCache{}
+	for i := 0; i < NumShards; i++ {
+		cache.shards[i] = &Shard{
+			items:     make(map[string]*list.Element),
+			evictList: list.New(),
+			lock:      sync.RWMutex{},
 		}
+	}
+	return cache
+}
 
-		newEntry := &CacheEntry{Key: key, Value: value}
-		element := c.lruList.PushFront(newEntry)
-		c.cache[key] = element
+// Get the shard for a key
+func (c *ShardedCache) getShard(key string) *Shard {
+	// Simple hash function to determine shard
+	hash := 0
+	for _, char := range key {
+		hash = 31*hash + int(char)
+	}
+	if hash < 0 {
+		hash = -hash
+	}
+	return c.shards[hash%NumShards]
+}
+
+// Add or update a key-value pair
+func (c *ShardedCache) Put(key, value string) error {
+	if len(key) > MaxKeySize || len(value) > MaxValueSize {
+		return fmt.Errorf("key or value exceeds maximum size")
+	}
+
+	// Calculate entry size (key + value + overhead)
+	entrySize := len(key) + len(value) + 64 // 64 bytes overhead estimate
+
+	shard := c.getShard(key)
+	shard.lock.Lock()
+	defer shard.lock.Unlock()
+
+	// If key exists, update it and move to front of eviction list
+	if element, found := shard.items[key]; found {
+		entry := element.Value.(*CacheEntry)
+		oldSize := entry.size
+
+		// Update the entry
+		entry.value = value
+		entry.timestamp = time.Now()
+		entry.size = entrySize
+		shard.evictList.MoveToFront(element)
+
+		// Update size tracking
+		sizeChange := entrySize - oldSize
+		shard.size += int64(sizeChange)
+
+		c.sizeLock.Lock()
+		c.totalSize += int64(sizeChange)
+		c.sizeLock.Unlock()
+	} else {
+		// Key doesn't exist, create new entry
+		entry := &CacheEntry{
+			value:     value,
+			timestamp: time.Now(),
+			size:      entrySize,
+		}
+		element := shard.evictList.PushFront(entry)
+		shard.items[key] = element
+
+		// Update size tracking
+		shard.size += int64(entrySize)
+
+		c.sizeLock.Lock()
+		c.totalSize += int64(entrySize)
+		c.sizeLock.Unlock()
 	}
 
 	return nil
 }
 
-// Get retrieves the value associated with a given key
-func (c *Cache) Get(key string) (string, error) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+// Get a value by key
+func (c *ShardedCache) Get(key string) (string, bool) {
+	shard := c.getShard(key)
+	shard.lock.RLock()
+	defer shard.lock.RUnlock()
 
-	if entry, ok := c.cache[key]; ok {
-		// Move accessed entry to front of LRU list
-		c.lruList.MoveToFront(entry)
-		return entry.Value.(*CacheEntry).Value, nil
+	if element, found := shard.items[key]; found {
+		// Update access time and move to front (under read lock)
+		entry := element.Value.(*CacheEntry)
+
+		// Clone the lock to write - this is a critical section
+		shard.lock.RUnlock()
+		shard.lock.Lock()
+
+		// Move to front now that we have write lock
+		entry.timestamp = time.Now()
+		shard.evictList.MoveToFront(element)
+
+		// Downgrade lock
+		value := entry.value
+		shard.lock.Unlock()
+		shard.lock.RLock()
+
+		return value, true
 	}
 
-	return "", errors.New("key not found")
+	return "", false
+}
+
+// Evict a single entry from a shard
+func (shard *Shard) evictOne() int64 {
+	if shard.evictList.Len() == 0 {
+		return 0
+	}
+
+	// Get the oldest entry
+	element := shard.evictList.Back()
+	if element == nil {
+		return 0
+	}
+
+	entry := element.Value.(*CacheEntry)
+
+	// Remove from list and map
+	shard.evictList.Remove(element)
+	for key, el := range shard.items {
+		if el == element {
+			delete(shard.items, key)
+			break
+		}
+	}
+
+	freedSize := int64(entry.size)
+	shard.size -= freedSize
+	return freedSize
+}
+
+// EvictBatch evicts multiple items at once
+func (c *ShardedCache) EvictBatch(count int) int64 {
+	var totalFreed int64 = 0
+
+	// Distribute evictions across shards
+	perShard := count / NumShards
+	if perShard < 1 {
+		perShard = 1
+	}
+
+	for i := 0; i < NumShards; i++ {
+		shard := c.shards[i]
+		shard.lock.Lock()
+
+		var shardFreed int64 = 0
+		for j := 0; j < perShard && shard.evictList.Len() > 0; j++ {
+			shardFreed += shard.evictOne()
+		}
+
+		shard.lock.Unlock()
+
+		c.sizeLock.Lock()
+		c.totalSize -= shardFreed
+		totalFreed += shardFreed
+		c.sizeLock.Unlock()
+	}
+
+	return totalFreed
+}
+
+// CheckMemory checks and manages memory usage
+func (c *ShardedCache) CheckMemory() {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+
+	memUsage := float64(m.Alloc) / float64(MaxMemoryBytes)
+
+	if memUsage >= MemoryThreshold {
+		log.Printf("Memory usage at %.2f%%, evicting cache entries", memUsage*100)
+		// Aggressive eviction under high memory pressure
+		c.EvictBatch(EvictionBatchSize)
+	}
+}
+
+// RunMemoryMonitor starts a goroutine to monitor memory
+func (c *ShardedCache) RunMemoryMonitor() {
+	ticker := time.NewTicker(CleanupInterval)
+	go func() {
+		for range ticker.C {
+			c.CheckMemory()
+		}
+	}()
 }
 
 func main() {
-	cache := NewCache(1000)
+	cache := NewShardedCache()
+	cache.RunMemoryMonitor()
 
-	router := mux.NewRouter()
-	router.HandleFunc("/put/{key}", func(w http.ResponseWriter, r *http.Request) {
-		vars := mux.Vars(r)
-		key := vars["key"]
-		value := r.URL.Query().Get("value")
+	// PUT endpoint
+	http.HandleFunc("/put", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return	
+		}
 
-		if len(key) > 256 || len(value) > 256 {
-			http.Error(w, "Key or value exceeds maximum length of 256 characters", http.StatusBadRequest)
+		var kv KeyValue
+		decoder := json.NewDecoder(r.Body)
+		if err := decoder.Decode(&kv); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(Response{
+				Status:  "ERROR",
+				Message: "Invalid request format",
+			})
 			return
 		}
 
-		if err := cache.Put(key, value); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+		if err := cache.Put(kv.Key, kv.Value); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(Response{
+				Status:  "ERROR",
+				Message: err.Error(),
+			})
 			return
 		}
 
-		w.WriteHeader(http.StatusCreated)
-	}).Methods("PUT")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(Response{
+			Status:  "OK",
+			Message: "Key inserted/updated successfully.",
+		})
+	})
 
-	router.HandleFunc("/get/{key}", func(w http.ResponseWriter, r *http.Request) {
-		vars := mux.Vars(r)
-		key := vars["key"]
-
-		value, err := cache.Get(key)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusNotFound)
+	// GET endpoint
+	http.HandleFunc("/get", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
-		json.NewEncoder(w).Encode(map[string]string{"value": value})
-	}).Methods("GET")
+		key := r.URL.Query().Get("key")
+		if key == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(Response{
+				Status:  "ERROR",
+				Message: "Key parameter is required",
+			})
+			return
+		}
 
-	http.ListenAndServe(":7171", router)
+		if value, found := cache.Get(key); found {
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(Response{
+				Status: "OK",
+				Key:    key,
+				Value:  value,
+			})
+		} else {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(Response{
+				Status:  "ERROR",
+				Message: "Key not found.",
+			})
+		}
+	})
+
+	// Start the server
+	fmt.Println("Starting server on port 7171...")
+	log.Fatal(http.ListenAndServe(":7171", nil))
 }
